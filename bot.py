@@ -124,6 +124,12 @@ def transcribe_audio(file_path: Path) -> str:
             "Сделай дословную расшифровку этого аудио на исходном языке."
             " Верни только текст без пояснений.",
             ready_file,
+    response = client.models.generate_content(
+        model=GEMINI_STT_MODEL,
+        contents=[
+            uploaded,
+            "Сделай дословную расшифровку этого аудио на исходном языке."
+            " Верни только текст без пояснений.",
         ],
     )
     transcript = _extract_response_text(response)
