@@ -5,8 +5,9 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError, RateLimitError
+from openai import InternalServerError, OpenAI, OpenAIError, RateLimitError
 from telegram import Update
+from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
@@ -22,6 +23,11 @@ NEUROAPI_API_KEY = os.getenv("NEUROAPI_API_KEY")
 NEUROAPI_BASE_URL = os.getenv("NEUROAPI_BASE_URL", "https://neuroapi.host/v1")
 NEUROAPI_STT_MODEL = os.getenv("NEUROAPI_STT_MODEL", "whisper-1")
 NEUROAPI_SUMMARY_MODEL = os.getenv("NEUROAPI_SUMMARY_MODEL", "gpt-3.5-turbo")
+NEUROAPI_SUMMARY_MODEL_FALLBACKS = [
+    model.strip()
+    for model in os.getenv("NEUROAPI_SUMMARY_MODEL_FALLBACKS", "").split(",")
+    if model.strip()
+]
 SUMMARY_STYLE = os.getenv(
     "SUMMARY_STYLE",
     "Сделай конспект: главные тезисы, выводы и список задач.",
@@ -73,31 +79,48 @@ def with_retry(callable_fn, operation_name: str):
 
 
 def summarize_text(transcript: str) -> str:
-    response = with_retry(
-        lambda: client.chat.completions.create(
-            model=NEUROAPI_SUMMARY_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Ты помощник, делающий краткие и точные конспекты на русском языке.",
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Инструкция: {SUMMARY_STYLE}\n\n"
-                        f"Сделай конспект этого текста:\n{transcript}"
-                    ),
-                },
-            ],
-            temperature=0.2,
-        ),
-        "summary",
-    )
+    summary_models = [NEUROAPI_SUMMARY_MODEL, *NEUROAPI_SUMMARY_MODEL_FALLBACKS]
+    last_error: Exception | None = None
 
-    result = (response.choices[0].message.content or "").strip()
-    if not result:
-        raise RuntimeError("NeuroAPI не вернул текст конспекта")
-    return result
+    for model_name in summary_models:
+        try:
+            response = with_retry(
+                lambda: client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Ты помощник, делающий краткие и точные конспекты на русском языке.",
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Инструкция: {SUMMARY_STYLE}\n\n"
+                                f"Сделай конспект этого текста:\n{transcript}"
+                            ),
+                        },
+                    ],
+                    temperature=0.2,
+                ),
+                f"summary:{model_name}",
+            )
+
+            result = (response.choices[0].message.content or "").strip()
+            if not result:
+                raise RuntimeError(f"NeuroAPI не вернул текст конспекта для модели {model_name}")
+            return result
+        except InternalServerError as exc:
+            last_error = exc
+            logger.warning("Модель конспекта %s недоступна: %s", model_name, exc)
+            continue
+        except OpenAIError as exc:
+            last_error = exc
+            logger.warning("Ошибка модели конспекта %s: %s", model_name, exc)
+            continue
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Не удалось получить конспект: не заданы рабочие модели")
 
 
 def transcribe_audio(file_path: Path) -> str:
@@ -185,7 +208,13 @@ def main() -> None:
     )
 
     logger.info("Бот запущен")
-    app.run_polling()
+    try:
+        app.run_polling()
+    except Conflict:
+        logger.error(
+            "Telegram Conflict: уже запущен другой polling-инстанс этого бота. "
+            "Останови второй процесс и запусти снова."
+        )
 
 
 if __name__ == "__main__":

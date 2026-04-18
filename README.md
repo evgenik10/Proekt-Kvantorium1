@@ -46,10 +46,14 @@
 - `NEUROAPI_BASE_URL` — по умолчанию `https://neuroapi.host/v1`
 - `NEUROAPI_STT_MODEL` — модель для транскрипции (по умолчанию `whisper-1`)
 - `NEUROAPI_SUMMARY_MODEL` — модель для конспекта (по умолчанию `gpt-3.5-turbo`)
+- `NEUROAPI_SUMMARY_MODEL_FALLBACKS` — список резервных моделей через запятую (используются, если основная недоступна на тарифе)
 - `NEUROAPI_MAX_RETRIES` / `NEUROAPI_RETRY_DELAY_SEC` — ретраи при rate limit.
 
 ## Важно
 Если получаешь 429/rate limit, бот автоматически ретраит запросы. Если ошибка постоянная — проверь лимиты/доступность модели в NeuroAPI.
+
+## Если ошибка `telegram.error.Conflict`
+Это означает, что уже запущен второй экземпляр бота с тем же токеном (два процесса `python bot.py` или polling + webhook). Оставь только один процесс.
 
 ## Полезные ссылки NeuroAPI
 - Getting started: https://neuroapi.host/docs/getting-started
