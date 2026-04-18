@@ -1,14 +1,17 @@
 import logging
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from openai import InternalServerError, OpenAI, OpenAIError, RateLimitError
 from telegram import Update
 from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from yt_dlp import YoutubeDL
 
 load_dotenv()
 
@@ -34,6 +37,7 @@ SUMMARY_STYLE = os.getenv(
 )
 NEUROAPI_MAX_RETRIES = int(os.getenv("NEUROAPI_MAX_RETRIES", "3"))
 NEUROAPI_RETRY_DELAY_SEC = float(os.getenv("NEUROAPI_RETRY_DELAY_SEC", "10"))
+YOUTUBE_TRANSCRIPT_MAX_CHARS = int(os.getenv("YOUTUBE_TRANSCRIPT_MAX_CHARS", "12000"))
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в .env")
@@ -139,6 +143,60 @@ def transcribe_audio(file_path: Path) -> str:
     return text.strip()
 
 
+def extract_youtube_url(text: str) -> str | None:
+    urls = re.findall(r"https?://\\S+", text)
+    for url in urls:
+        normalized_url = url.strip().rstrip(").,]")
+        parsed = urlparse(normalized_url)
+        host = parsed.netloc.lower().replace("www.", "")
+        if host in {"youtu.be", "youtube.com", "m.youtube.com"}:
+            return normalized_url
+    return None
+
+
+def download_youtube_audio(youtube_url: str, target_dir: Path) -> Path:
+    output_template = str(target_dir / "%(id)s.%(ext)s")
+    options = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(youtube_url, download=True)
+        downloaded_file = Path(ydl.prepare_filename(info))
+
+    if downloaded_file.exists():
+        return downloaded_file
+
+    raise RuntimeError("Не удалось скачать аудио дорожку YouTube-видео")
+
+
+async def process_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not message.text:
+        return
+
+    youtube_url = extract_youtube_url(message.text)
+    if not youtube_url:
+        return
+
+    await message.reply_text("🎬 Нашел YouTube-ссылку. Делаю конспект видео...")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio_path = download_youtube_audio(youtube_url, Path(tmp_dir))
+            transcript = transcribe_audio(audio_path)
+
+        transcript = transcript[:YOUTUBE_TRANSCRIPT_MAX_CHARS]
+        summary = summarize_text(transcript)
+        await message.reply_text(f"📌 Конспект видео:\n\n{summary}")
+    except Exception as exc:
+        logger.exception("Ошибка при обработке YouTube-ссылки: %s", exc)
+        await message.reply_text("Не получилось сделать конспект этого видео. Попробуй другую ссылку.")
+
+
 async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message:
@@ -204,6 +262,12 @@ def main() -> None:
             | filters.AUDIO
             | (filters.Document.ALL & filters.Document.MimeType("audio/")),
             process_audio,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            process_text_message,
         )
     )
 
