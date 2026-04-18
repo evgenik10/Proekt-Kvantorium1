@@ -1,10 +1,11 @@
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from google import genai
+from openai import OpenAI, OpenAIError, RateLimitError
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -17,20 +18,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_STT_MODEL = os.getenv("GEMINI_STT_MODEL", "gemini-2.0-flash")
-GEMINI_SUMMARY_MODEL = os.getenv("GEMINI_SUMMARY_MODEL", "gemini-2.0-flash")
+NEUROAPI_API_KEY = os.getenv("NEUROAPI_API_KEY")
+NEUROAPI_BASE_URL = os.getenv("NEUROAPI_BASE_URL", "https://neuroapi.host/v1")
+NEUROAPI_STT_MODEL = os.getenv("NEUROAPI_STT_MODEL", "whisper-1")
+NEUROAPI_SUMMARY_MODEL = os.getenv("NEUROAPI_SUMMARY_MODEL", "gpt-3.5-turbo")
 SUMMARY_STYLE = os.getenv(
     "SUMMARY_STYLE",
     "Сделай конспект: главные тезисы, выводы и список задач.",
 )
+NEUROAPI_MAX_RETRIES = int(os.getenv("NEUROAPI_MAX_RETRIES", "3"))
+NEUROAPI_RETRY_DELAY_SEC = float(os.getenv("NEUROAPI_RETRY_DELAY_SEC", "10"))
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в .env")
-if not GEMINI_API_KEY:
-    raise RuntimeError("Не задан GEMINI_API_KEY в .env")
+if not NEUROAPI_API_KEY:
+    raise RuntimeError("Не задан NEUROAPI_API_KEY в .env")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = OpenAI(api_key=NEUROAPI_API_KEY, base_url=NEUROAPI_BASE_URL)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -49,54 +53,67 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-def _extract_response_text(response) -> str:
-    text = getattr(response, "text", None)
-    if text:
-        return text.strip()
-
-    candidates = getattr(response, "candidates", None) or []
-    parts: list[str] = []
-    for candidate in candidates:
-        content = getattr(candidate, "content", None)
-        if not content:
-            continue
-        for part in getattr(content, "parts", None) or []:
-            part_text = getattr(part, "text", None)
-            if part_text:
-                parts.append(part_text)
-
-    return "\n".join(parts).strip()
+def with_retry(callable_fn, operation_name: str):
+    for attempt in range(1, NEUROAPI_MAX_RETRIES + 1):
+        try:
+            return callable_fn()
+        except RateLimitError as exc:
+            if attempt == NEUROAPI_MAX_RETRIES:
+                raise
+            delay = NEUROAPI_RETRY_DELAY_SEC * attempt
+            logger.warning(
+                "%s: rate-limit, retry %s/%s через %.1f сек. Ошибка: %s",
+                operation_name,
+                attempt,
+                NEUROAPI_MAX_RETRIES,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
 
 
 def summarize_text(transcript: str) -> str:
-    response = client.models.generate_content(
-        model=GEMINI_SUMMARY_MODEL,
-        contents=(
-            "Ты помощник, делающий краткие и точные конспекты на русском языке.\n"
-            f"Инструкция: {SUMMARY_STYLE}\n\n"
-            f"Сделай конспект этого текста:\n{transcript}"
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model=NEUROAPI_SUMMARY_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Ты помощник, делающий краткие и точные конспекты на русском языке.",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Инструкция: {SUMMARY_STYLE}\n\n"
+                        f"Сделай конспект этого текста:\n{transcript}"
+                    ),
+                },
+            ],
+            temperature=0.2,
         ),
+        "summary",
     )
-    summary = _extract_response_text(response)
-    if not summary:
-        raise RuntimeError("Gemini не вернул текст конспекта")
-    return summary
+
+    result = (response.choices[0].message.content or "").strip()
+    if not result:
+        raise RuntimeError("NeuroAPI не вернул текст конспекта")
+    return result
 
 
 def transcribe_audio(file_path: Path) -> str:
-    uploaded = client.files.upload(file=file_path)
-    response = client.models.generate_content(
-        model=GEMINI_STT_MODEL,
-        contents=[
-            uploaded,
-            "Сделай дословную расшифровку этого аудио на исходном языке."
-            " Верни только текст без пояснений.",
-        ],
-    )
-    transcript = _extract_response_text(response)
-    if not transcript:
-        raise RuntimeError("Gemini не вернул текст расшифровки")
-    return transcript
+    def _call():
+        with file_path.open("rb") as audio_file:
+            return client.audio.transcriptions.create(
+                model=NEUROAPI_STT_MODEL,
+                file=audio_file,
+            )
+
+    transcript = with_retry(_call, "transcription")
+
+    text = getattr(transcript, "text", "")
+    if not text:
+        raise RuntimeError("NeuroAPI не вернул текст расшифровки")
+    return text.strip()
 
 
 async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -138,6 +155,13 @@ async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         await message.reply_text(f"📝 Полный текст:\n\n{transcript}")
         await message.reply_text(f"📌 Конспект:\n\n{summary}")
+    except RateLimitError:
+        await message.reply_text(
+            "Лимит запросов исчерпан. Подожди немного и попробуй снова."
+        )
+    except OpenAIError as exc:
+        logger.exception("Ошибка NeuroAPI/OpenAI-совместимого запроса: %s", exc)
+        await message.reply_text("Ошибка запроса к NeuroAPI. Проверь модель/ключ и попробуй еще раз.")
     except Exception as exc:
         logger.exception("Ошибка при обработке аудио: %s", exc)
         await message.reply_text("Произошла ошибка при обработке. Попробуй еще раз.")
