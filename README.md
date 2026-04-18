@@ -26,7 +26,10 @@
 4. Заполни `.env`:
    - `TELEGRAM_BOT_TOKEN` — токен бота от @BotFather
    - `GEMINI_API_KEY` — API-ключ Gemini
-5. Запусти:
+5. (Опционально) подкрути ожидание обработки файла Gemini:
+   - `GEMINI_FILE_WAIT_TIMEOUT_SEC=60`
+   - `GEMINI_FILE_POLL_INTERVAL_SEC=1.5`
+6. Запусти:
    ```bash
    python bot.py
    ```
@@ -53,3 +56,7 @@
 - Разделение конспектов по шаблонам: встреча, лекция, интервью.
 - Поддержка нескольких языков + автоопределение.
 - Форматирование в Markdown и экспорт в Notion/Google Docs.
+
+
+## Если бот зависает после upload
+Это обычно значит, что файл ещё обрабатывается на стороне Gemini. В проекте уже добавлено ожидание статуса `ACTIVE` с таймаутом через переменные `GEMINI_FILE_WAIT_TIMEOUT_SEC` и `GEMINI_FILE_POLL_INTERVAL_SEC`. Если аудио длинное — увеличь таймаут.

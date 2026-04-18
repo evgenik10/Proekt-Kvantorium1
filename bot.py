@@ -1,6 +1,7 @@
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -24,6 +25,9 @@ SUMMARY_STYLE = os.getenv(
     "SUMMARY_STYLE",
     "Сделай конспект: главные тезисы, выводы и список задач.",
 )
+
+GEMINI_FILE_WAIT_TIMEOUT_SEC = int(os.getenv("GEMINI_FILE_WAIT_TIMEOUT_SEC", "60"))
+GEMINI_FILE_POLL_INTERVAL_SEC = float(os.getenv("GEMINI_FILE_POLL_INTERVAL_SEC", "1.5"))
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в .env")
@@ -68,6 +72,33 @@ def _extract_response_text(response) -> str:
     return "\n".join(parts).strip()
 
 
+def _state_name(file_obj) -> str:
+    state = getattr(file_obj, "state", None)
+    if state is None:
+        return "UNKNOWN"
+    return getattr(state, "name", str(state))
+
+
+def wait_until_file_ready(file_obj):
+    deadline = time.time() + GEMINI_FILE_WAIT_TIMEOUT_SEC
+    current = file_obj
+
+    while time.time() < deadline:
+        current = client.files.get(name=current.name)
+        state = _state_name(current)
+
+        if state == "ACTIVE":
+            return current
+        if state == "FAILED":
+            raise RuntimeError("Gemini не смог обработать аудиофайл (state=FAILED)")
+
+        time.sleep(GEMINI_FILE_POLL_INTERVAL_SEC)
+
+    raise TimeoutError(
+        f"Gemini слишком долго обрабатывает файл (>{GEMINI_FILE_WAIT_TIMEOUT_SEC}с)"
+    )
+
+
 def summarize_text(transcript: str) -> str:
     response = client.models.generate_content(
         model=GEMINI_SUMMARY_MODEL,
@@ -85,6 +116,14 @@ def summarize_text(transcript: str) -> str:
 
 def transcribe_audio(file_path: Path) -> str:
     uploaded = client.files.upload(file=file_path)
+    ready_file = wait_until_file_ready(uploaded)
+
+    response = client.models.generate_content(
+        model=GEMINI_STT_MODEL,
+        contents=[
+            "Сделай дословную расшифровку этого аудио на исходном языке."
+            " Верни только текст без пояснений.",
+            ready_file,
     response = client.models.generate_content(
         model=GEMINI_STT_MODEL,
         contents=[
